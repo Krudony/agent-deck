@@ -222,3 +222,39 @@ func TestBuildClaudeCommand(t *testing.T) {
 		t.Errorf("Non-claude command should not be modified, got: %s", shellCmd)
 	}
 }
+
+// TestCreateForkedInstance_NoSessionIDFlag tests that forked sessions
+// do NOT use --session-id flag (incompatible with --resume)
+func TestCreateForkedInstance_NoSessionIDFlag(t *testing.T) {
+	inst := NewInstance("original", "/tmp/test")
+	inst.ClaudeSessionID = "parent-abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	forked, cmd, err := inst.CreateForkedInstance("forked", "")
+	if err != nil {
+		t.Fatalf("CreateForkedInstance() failed: %v", err)
+	}
+
+	// Command should NOT contain --session-id (incompatible with --resume)
+	if strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork command should NOT contain --session-id (incompatible with --resume), got: %s", cmd)
+	}
+
+	// Command SHOULD contain --resume and --fork-session
+	if !strings.Contains(cmd, "--resume parent-abc-123") {
+		t.Errorf("Fork command should contain --resume with parent ID, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--fork-session") {
+		t.Errorf("Fork command should contain --fork-session, got: %s", cmd)
+	}
+
+	// Forked instance should have empty ClaudeSessionID (will be detected later)
+	if forked.ClaudeSessionID != "" {
+		t.Errorf("Forked instance should have empty ClaudeSessionID (detected later), got: %s", forked.ClaudeSessionID)
+	}
+
+	// Forked instance should have fork flag in command
+	if !strings.Contains(forked.Command, "--fork-session") {
+		t.Errorf("Forked instance Command should contain --fork-session, got: %s", forked.Command)
+	}
+}
