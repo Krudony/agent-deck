@@ -144,7 +144,8 @@ func (w *SetupWizard) GetConfig() *session.UserConfig {
 	}
 
 	// Set Claude settings
-	config.Claude.DangerousMode = w.dangerousMode
+	dangModeValue := w.dangerousMode
+	config.Claude.DangerousMode = &dangModeValue
 	if !w.useDefaultConfigDir && w.customConfigDir != "" {
 		config.Claude.ConfigDir = w.customConfigDir
 	}

@@ -143,7 +143,10 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	}
 
 	// Claude settings
-	s.dangerousMode = config.Claude.DangerousMode
+	s.dangerousMode = true // default
+	if config.Claude.DangerousMode != nil {
+		s.dangerousMode = *config.Claude.DangerousMode
+	}
 	s.claudeConfigDir = config.Claude.ConfigDir
 
 	// Update settings
@@ -195,7 +198,8 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	}
 
 	// Claude settings
-	config.Claude.DangerousMode = s.dangerousMode
+	dangModeValue := s.dangerousMode
+	config.Claude.DangerousMode = &dangModeValue
 	config.Claude.ConfigDir = s.claudeConfigDir
 
 	// Update settings

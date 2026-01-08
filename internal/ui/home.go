@@ -1743,9 +1743,9 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 
 		// Build resume command with config dir and dangerous mode
 		userConfig, _ := session.LoadUserConfig()
-		dangerousMode := false
-		if userConfig != nil {
-			dangerousMode = userConfig.Claude.DangerousMode
+		dangerousMode := true
+		if userConfig != nil && userConfig.Claude.DangerousMode != nil {
+			dangerousMode = *userConfig.Claude.DangerousMode
 		}
 
 		// Build command - only set CLAUDE_CONFIG_DIR if explicitly configured
