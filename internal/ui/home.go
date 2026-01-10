@@ -600,8 +600,29 @@ func (h *Home) syncViewport() {
 	// contentHeight = total height for main content area
 	// -1 for header line, -helpBarHeight for help bar, -updateBannerHeight, -filterBarHeight
 	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - filterBarHeight
-	// panelContentHeight = space available for session list (excluding title)
-	panelContentHeight := contentHeight - panelTitleLines
+
+	// CRITICAL: Calculate panelContentHeight based on current layout mode
+	// This MUST match the calculations in renderStackedLayout/renderDualColumnLayout/renderSingleColumnLayout
+	var panelContentHeight int
+	layoutMode := h.getLayoutMode()
+	switch layoutMode {
+	case LayoutModeStacked:
+		// Stacked layout: list gets 60% of height, minus title (2 lines)
+		// Must match: listHeight := (totalHeight * 60) / 100; listContent height = listHeight - 2
+		listHeight := (contentHeight * 60) / 100
+		if listHeight < 5 {
+			listHeight = 5
+		}
+		panelContentHeight = listHeight - panelTitleLines
+	case LayoutModeSingle:
+		// Single column: list gets full height minus title
+		// Must match: listHeight := totalHeight - 2
+		panelContentHeight = contentHeight - panelTitleLines
+	default: // LayoutModeDual
+		// Dual layout: list panel gets full contentHeight minus title
+		panelContentHeight = contentHeight - panelTitleLines
+	}
+
 	// maxVisible = how many items can be shown (reserving 1 for "more below" indicator)
 	maxVisible := panelContentHeight - 1
 	if maxVisible < 1 {
@@ -1552,7 +1573,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				h.setupWizard.Hide()
 				// Reload config cache
-				session.ReloadUserConfig()
+				_, _ = session.ReloadUserConfig()
 				// Apply default tool to new dialog
 				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
 					h.newDialog.SetDefaultTool(defaultTool)
@@ -1573,7 +1594,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					h.err = err
 					h.errTime = time.Now()
 				}
-				session.ReloadUserConfig()
+				_, _ = session.ReloadUserConfig()
 				// Apply default tool to new dialog
 				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
 					h.newDialog.SetDefaultTool(defaultTool)
@@ -2006,16 +2027,43 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "g":
-		// Create new group (or subgroup if a group is selected)
+		// Create new group based on context:
+		// - Session in a group → create subgroup in session's group
+		// - Group selected → create peer group (sibling at same level)
+		// - Root level → create root-level group
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeGroup {
-				// Create subgroup under selected group
-				h.groupDialog.ShowCreateSubgroup(item.Group.Path, item.Group.Name)
+				// Group selected: create peer group (sibling)
+				// Get parent path by removing last segment
+				parentPath := ""
+				parentName := ""
+				if idx := strings.LastIndex(item.Group.Path, "/"); idx > 0 {
+					parentPath = item.Group.Path[:idx]
+					// Get parent name from parent path
+					if lastIdx := strings.LastIndex(parentPath, "/"); lastIdx >= 0 {
+						parentName = parentPath[lastIdx+1:]
+					} else {
+						parentName = parentPath
+					}
+					h.groupDialog.ShowCreateSubgroup(parentPath, parentName)
+				} else {
+					// Top-level group: create another root-level group
+					h.groupDialog.Show()
+				}
+				return h, nil
+			} else if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.GroupPath != "" {
+				// Session in a group: create subgroup in session's group
+				groupPath := item.Session.GroupPath
+				groupName := groupPath
+				if idx := strings.LastIndex(groupPath, "/"); idx >= 0 {
+					groupName = groupPath[idx+1:]
+				}
+				h.groupDialog.ShowCreateSubgroup(groupPath, groupName)
 				return h, nil
 			}
 		}
-		// Create root-level group
+		// Create root-level group (no selection or session at root)
 		h.groupDialog.Show()
 		return h, nil
 
@@ -2308,6 +2356,8 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				log.Printf("[MCP-DEBUG] Calling restartSession for: %s (with MCP loading animation)", targetInst.ID)
 				// Track as MCP loading for animation in preview pane
 				h.mcpLoadingSessions[targetInst.ID] = time.Now()
+				// Set flag to skip MCP regeneration (Apply just wrote the config)
+				targetInst.SkipMCPRegenerate = true
 				// Restart the session to apply MCP changes
 				h.mcpDialog.Hide()
 				return h, h.restartSession(targetInst)
@@ -3432,6 +3482,53 @@ func ensureExactHeight(content string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// ensureExactWidth ensures each line in content has exactly the specified visual width.
+// This is essential for proper horizontal panel alignment in lipgloss.JoinHorizontal.
+//
+// Behavior:
+//   - Strips ANSI codes to measure true visual width
+//   - Pads short lines with spaces to reach target width
+//   - Truncates long lines with "..." suffix
+//   - Preserves ANSI styling where possible
+//
+// This fixes the "bleeding" issue where right panel content appears in left panel
+// due to inconsistent line widths causing JoinHorizontal misalignment.
+func ensureExactWidth(content string, width int) string {
+	if width <= 0 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	result := make([]string, len(lines))
+
+	for i, line := range lines {
+		// Measure visual width (excluding ANSI codes)
+		cleanLine := tmux.StripANSI(line)
+		displayWidth := runewidth.StringWidth(cleanLine)
+
+		if displayWidth == width {
+			// Already correct width
+			result[i] = line
+		} else if displayWidth < width {
+			// Pad with spaces to reach target width
+			padding := width - displayWidth
+			result[i] = line + strings.Repeat(" ", padding)
+		} else {
+			// Line too wide - truncate the clean version
+			// Note: This loses ANSI styling but prevents layout corruption
+			truncated := runewidth.Truncate(cleanLine, width-3, "...")
+			// Pad if truncation made it shorter
+			truncWidth := runewidth.StringWidth(truncated)
+			if truncWidth < width {
+				truncated += strings.Repeat(" ", width-truncWidth)
+			}
+			result[i] = truncated
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
 // renderDualColumnLayout renders side-by-side panels for wide terminals (80+ cols)
 func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	var b strings.Builder
@@ -3471,7 +3568,12 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	leftPanel = ensureExactHeight(leftPanel, contentHeight)
 	rightPanel = ensureExactHeight(rightPanel, contentHeight)
 
-	// Join panels horizontally - all components have exact heights now
+	// CRITICAL: Ensure both panels have exactly the correct width for proper alignment
+	// Without this, variable-width lines cause JoinHorizontal to misalign content
+	leftPanel = ensureExactWidth(leftPanel, leftWidth)
+	rightPanel = ensureExactWidth(rightPanel, rightWidth)
+
+	// Join panels horizontally - all components have exact heights AND widths now
 	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, separator, rightPanel)
 	b.WriteString(mainContent)
 

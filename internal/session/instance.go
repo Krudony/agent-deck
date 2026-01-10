@@ -70,6 +70,11 @@ type Instance struct {
 	// Used to provide grace period for tmux session creation (prevents error flash)
 	// Not serialized - only relevant for current TUI session
 	lastStartTime time.Time
+
+	// SkipMCPRegenerate skips .mcp.json regeneration on next Restart()
+	// Set by MCP dialog Apply() to avoid race condition where Apply writes
+	// config then Restart immediately overwrites it with different pool state
+	SkipMCPRegenerate bool `json:"-"` // Don't persist, transient flag
 }
 
 // MarkAccessed updates the LastAccessedAt timestamp to now
@@ -1045,10 +1050,19 @@ func (i *Instance) Restart() error {
 	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, GeminiSessionID=%q, CodexSessionID=%q, tmuxSession=%v, tmuxExists=%v",
 		i.Tool, i.ClaudeSessionID, i.GeminiSessionID, i.CodexSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
 
+	// Clear flag immediately to prevent it staying set if restart fails
+	skipRegen := i.SkipMCPRegenerate
+	i.SkipMCPRegenerate = false
+
 	// Regenerate .mcp.json before restart to use socket pool if available
-	// This ensures Claude picks up socket configs instead of stdio
-	if i.Tool == "claude" {
-		i.regenerateMCPConfig()
+	// Skip if MCP dialog just wrote the config (avoids race condition)
+	if i.Tool == "claude" && !skipRegen {
+		if err := i.regenerateMCPConfig(); err != nil {
+			log.Printf("[MCP-DEBUG] Warning: MCP config regeneration failed: %v", err)
+			// Continue with restart - Claude will use existing .mcp.json or defaults
+		}
+	} else if skipRegen {
+		log.Printf("[MCP-DEBUG] Skipping MCP regeneration (flag set by Apply)")
 	}
 
 	// If Claude session with known ID AND tmux session exists, use respawn-pane
@@ -1344,24 +1358,27 @@ func (i *Instance) CaptureLoadedMCPs() {
 // regenerateMCPConfig regenerates .mcp.json with current pool status
 // If socket pool is running, MCPs will use socket configs (nc -U /tmp/...)
 // Otherwise, MCPs will use stdio configs (npx ...)
-func (i *Instance) regenerateMCPConfig() {
+// Returns error if .mcp.json write fails
+func (i *Instance) regenerateMCPConfig() error {
 	mcpInfo := GetMCPInfo(i.ProjectPath)
 	if mcpInfo == nil {
-		return
+		return nil // No MCP info, nothing to regenerate
 	}
 
 	localMCPs := mcpInfo.Local()
 	if len(localMCPs) == 0 {
-		return
+		return nil // No local MCPs, nothing to regenerate
 	}
 
 	// Regenerate .mcp.json - WriteMCPJsonFromConfig checks pool status
 	// and writes socket configs if pool is running
 	if err := WriteMCPJsonFromConfig(i.ProjectPath, localMCPs); err != nil {
 		log.Printf("[MCP-DEBUG] Failed to regenerate .mcp.json: %v", err)
-	} else {
-		log.Printf("[MCP-DEBUG] Regenerated .mcp.json for %s with %d MCPs", i.Title, len(localMCPs))
+		return fmt.Errorf("failed to regenerate .mcp.json: %w", err)
 	}
+
+	log.Printf("[MCP-DEBUG] Regenerated .mcp.json for %s with %d MCPs", i.Title, len(localMCPs))
+	return nil
 }
 
 // generateID generates a unique session ID

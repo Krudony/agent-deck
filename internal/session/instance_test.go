@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -775,6 +776,127 @@ func TestInstance_GetMCPInfo_Unknown(t *testing.T) {
 	}
 }
 
+func TestInstance_RegenerateMCPConfig_ReturnsError(t *testing.T) {
+	// This test verifies that regenerateMCPConfig() returns an error type
+	// The actual error propagation from WriteMCPJsonFromConfig is tested
+	// by verifying the function compiles with error return type and handles
+	// the various early-return cases correctly.
+
+	// Test case 1: No .mcp.json exists - returns nil (nothing to regenerate)
+	inst := &Instance{
+		ID:          "test-123",
+		Title:       "Test Session",
+		ProjectPath: "/nonexistent/path",
+		Tool:        "claude",
+	}
+	err := inst.regenerateMCPConfig()
+	if err != nil {
+		t.Errorf("expected nil error for nonexistent path (no MCPs to regenerate), got: %v", err)
+	}
+
+	// Test case 2: Valid path with empty .mcp.json - returns nil
+	tmpDir, err := os.MkdirTemp("", "agentdeck-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create an empty .mcp.json
+	mcpPath := filepath.Join(tmpDir, ".mcp.json")
+	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`), 0644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	inst.ProjectPath = tmpDir
+	err = inst.regenerateMCPConfig()
+	if err != nil {
+		t.Errorf("expected nil error for empty .mcp.json, got: %v", err)
+	}
+
+	// Test case 3: .mcp.json with MCPs but not in config.toml - returns nil
+	// (Local() returns MCP names, but WriteMCPJsonFromConfig skips unknown MCPs)
+	mcpJSON := `{"mcpServers":{"unknown-mcp":{"command":"echo","args":["hello"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(mcpJSON), 0644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	err = inst.regenerateMCPConfig()
+	// This returns nil because "unknown-mcp" is not in GetAvailableMCPs()
+	// so WriteMCPJsonFromConfig writes an empty mcpServers, which succeeds
+	if err != nil {
+		t.Errorf("expected nil error for unknown MCP (not in config.toml), got: %v", err)
+	}
+
+	// Note: To test actual write failure would require:
+	// 1. An MCP defined in config.toml
+	// 2. That MCP also in .mcp.json
+	// 3. Directory made read-only after .mcp.json creation
+	// This is an integration test scenario rather than unit test
+}
+
+func TestInstance_RegenerateMCPConfig_WriteFailure(t *testing.T) {
+	// Skip on non-Unix systems where permission changes might not work
+	if os.Getenv("CI") != "" {
+		t.Skip("Skipping permission-based test in CI")
+	}
+
+	// Create a temp directory
+	tmpDir, err := os.MkdirTemp("", "agentdeck-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() {
+		// Restore permissions before cleanup
+		_ = os.Chmod(tmpDir, 0755)
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	// Create .mcp.json with an MCP that exists in GetAvailableMCPs()
+	// We'll use a real MCP name that might exist, or the test gracefully handles it
+	mcpPath := filepath.Join(tmpDir, ".mcp.json")
+
+	// First, check what MCPs are available
+	availableMCPs := GetAvailableMCPs()
+	if len(availableMCPs) == 0 {
+		t.Skip("No MCPs configured in config.toml, skipping write failure test")
+	}
+
+	// Use the first available MCP
+	var mcpName string
+	for name := range availableMCPs {
+		mcpName = name
+		break
+	}
+
+	mcpJSON := `{"mcpServers":{"` + mcpName + `":{"command":"echo","args":["hello"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(mcpJSON), 0644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	// Make directory read-only AFTER writing .mcp.json
+	if err := os.Chmod(tmpDir, 0555); err != nil {
+		t.Fatalf("failed to make directory read-only: %v", err)
+	}
+
+	inst := &Instance{
+		ID:          "test-write-failure",
+		Title:       "Test Write Failure",
+		ProjectPath: tmpDir,
+		Tool:        "claude",
+	}
+
+	// Clear MCP info cache to ensure fresh read
+	ClearMCPCache(tmpDir)
+
+	err = inst.regenerateMCPConfig()
+	// We expect an error because the directory is read-only
+	if err == nil {
+		t.Error("expected error for read-only directory, got nil")
+	} else {
+		t.Logf("Got expected error: %v", err)
+	}
+}
+
 func TestInstance_CanFork_Gemini(t *testing.T) {
 	// Test 1: Gemini tool with valid session ID should NOT be forkable
 	// Gemini CLI has NO --fork-session flag (unlike Claude)
@@ -933,6 +1055,53 @@ func TestInstance_Fork_PathWithSpaces(t *testing.T) {
 	// Should NOT contain unquoted path that would break
 	if strings.Contains(cmd, "cd /tmp/Test Path With Spaces &&") {
 		t.Errorf("Fork command should not have unquoted path.\nGot: %s", cmd)
+	}
+}
+
+// TestInstance_Restart_SkipMCPRegenerate tests that SkipMCPRegenerate prevents double-write
+// race condition when MCP dialog Apply() is followed immediately by Restart()
+func TestInstance_Restart_SkipMCPRegenerate(t *testing.T) {
+	// This test verifies that SkipMCPRegenerate prevents double-write
+	inst := &Instance{
+		ID:                "test-skip-123",
+		Title:             "Test Skip Regen",
+		ProjectPath:       t.TempDir(),
+		Tool:              "claude",
+		SkipMCPRegenerate: true,
+	}
+
+	// Write a marker file to detect if regenerateMCPConfig was called
+	mcpFile := filepath.Join(inst.ProjectPath, ".mcp.json")
+	originalContent := `{"mcpServers":{"marker":{"command":"test"}}}`
+	if err := os.WriteFile(mcpFile, []byte(originalContent), 0644); err != nil {
+		t.Fatalf("failed to write marker file: %v", err)
+	}
+
+	// After Restart with SkipMCPRegenerate=true, original content should be preserved
+	// (In real scenario, Restart would fail because no tmux, but the flag check happens first)
+
+	// Verify the flag is set
+	if !inst.SkipMCPRegenerate {
+		t.Error("SkipMCPRegenerate should be true")
+	}
+
+	// Call Restart - it will fail due to no tmux session, but we can verify
+	// the flag was consumed by checking if it's now false
+	_ = inst.Restart() // Will fail, but that's expected
+
+	// Verify the flag was cleared after use
+	if inst.SkipMCPRegenerate {
+		t.Error("SkipMCPRegenerate should be false after Restart() consumes it")
+	}
+
+	// Verify the original content was preserved (regenerateMCPConfig was skipped)
+	content, err := os.ReadFile(mcpFile)
+	if err != nil {
+		t.Fatalf("failed to read marker file: %v", err)
+	}
+
+	if string(content) != originalContent {
+		t.Errorf("MCP config was modified when it should have been skipped.\nOriginal: %s\nActual: %s", originalContent, string(content))
 	}
 }
 
