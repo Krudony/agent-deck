@@ -1735,8 +1735,16 @@ func (i *Instance) Kill() error {
 // For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
 // For dead sessions or unknown ID: recreates the tmux session
 func (i *Instance) Restart() error {
-	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, tmuxSession=%v, tmuxExists=%v",
-		i.Tool, i.ClaudeSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, GeminiSessionID=%q, tmuxSession=%v, tmuxExists=%v",
+		i.Tool, i.ClaudeSessionID, i.GeminiSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+
+	// For Gemini: Update session ID from filesystem BEFORE attempting restart
+	// This ensures we have the latest session ID even if agent-deck was restarted
+	if i.Tool == "gemini" {
+		log.Printf("[RESTART-DEBUG] Gemini: calling UpdateGeminiSession() to detect session ID")
+		i.UpdateGeminiSession(nil)
+		log.Printf("[RESTART-DEBUG] Gemini: after UpdateGeminiSession, GeminiSessionID=%q", i.GeminiSessionID)
+	}
 
 	// Clear flag immediately to prevent it staying set if restart fails
 	skipRegen := i.SkipMCPRegenerate
