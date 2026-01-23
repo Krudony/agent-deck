@@ -1055,31 +1055,64 @@ func (i *Instance) SetGeminiYoloMode(enabled bool) {
 	}
 }
 
-// UpdateGeminiSession updates the Gemini session ID and YOLO mode from tmux environment.
-// The capture-resume pattern (used in Start/Restart) sets GEMINI_SESSION_ID
-// in the tmux environment, making this the single authoritative source.
-//
-// No file scanning fallback - we rely on the consistent capture-resume pattern.
+// UpdateGeminiSession updates the Gemini session ID and YOLO mode.
+// Always scans filesystem for the most recent session to handle cases where:
+// - User started a new session but we still have old ID
+// - Session ID changed but tmux env wasn't updated
+// - Agent-deck was restarted and needs to detect existing sessions
+// This ensures we always use the CURRENT session.
 func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	if i.Tool != "gemini" {
 		return
 	}
 
-	// Read from tmux environment (set by capture-resume pattern)
+	// 1. Detect YOLO Mode from tmux environment (authoritative sync)
 	if i.tmuxSession != nil {
-		// 1. Detect Session ID
-		if sessionID, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && sessionID != "" {
-			if i.GeminiSessionID != sessionID {
-				i.GeminiSessionID = sessionID
-			}
-			i.GeminiDetectedAt = time.Now()
-		}
-
-		// 2. Detect YOLO Mode from environment (authoritative sync)
 		if yoloEnv, err := i.tmuxSession.GetEnvironment("GEMINI_YOLO_MODE"); err == nil && yoloEnv != "" {
 			enabled := yoloEnv == "true"
 			i.GeminiYoloMode = &enabled
 		}
+	}
+
+	// 2. Always scan for the most recent session from files
+	// This handles cases where:
+	// - User started a new session but we still have old ID
+	// - Session ID changed but tmux env wasn't updated
+	// This ensures we always use the CURRENT session
+
+	// Scan for most recent session from files
+	sessions, err := ListGeminiSessions(i.ProjectPath)
+	if err != nil || len(sessions) == 0 {
+		// No sessions found at expected path - try searching ALL project directories
+		// This handles cases where session was created in different working directory
+		if i.GeminiSessionID != "" {
+			// We have a session ID from sessions.json - try to find it anywhere
+			sessionFile := findGeminiSessionInAllProjects(i.GeminiSessionID)
+			if sessionFile != "" {
+				// Found it! Keep the session ID we already have
+				i.GeminiDetectedAt = time.Now()
+				// Update tmux env to match (if tmux session exists)
+				if i.tmuxSession != nil && i.tmuxSession.Exists() {
+					_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+				}
+			}
+		}
+		return
+	}
+
+	// Use the most recent session (already sorted by LastUpdated)
+	for _, sess := range sessions {
+		if excludeIDs != nil && excludeIDs[sess.SessionID] {
+			continue
+		}
+		// Always use the most recent session - don't check if it's different
+		i.GeminiSessionID = sess.SessionID
+		i.GeminiDetectedAt = time.Now()
+		// Update tmux env to match (if tmux session exists)
+		if i.tmuxSession != nil && i.tmuxSession.Exists() {
+			_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sess.SessionID)
+		}
+		return
 	}
 
 	// Update analytics if we have a session ID
@@ -1095,8 +1128,18 @@ func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	if i.GeminiSessionID != "" && len(i.GeminiSessionID) >= 8 {
 		sessionsDir := GetGeminiSessionsDir(i.ProjectPath)
 		pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
-		if files, _ := filepath.Glob(pattern); len(files) > 0 {
-			if data, err := os.ReadFile(files[0]); err == nil {
+		files, _ := filepath.Glob(pattern)
+
+		var sessionFile string
+		if len(files) > 0 {
+			sessionFile = files[0]
+		} else {
+			// Not found at expected path - search ALL project directories
+			sessionFile = findGeminiSessionInAllProjects(i.GeminiSessionID)
+		}
+
+		if sessionFile != "" {
+			if data, err := os.ReadFile(sessionFile); err == nil {
 				if prompt, err := parseGeminiLatestUserPrompt(data); err == nil && prompt != "" {
 					i.LatestPrompt = prompt
 				}
@@ -1488,10 +1531,17 @@ func (i *Instance) getGeminiLastResponse() (*ResponseOutput, error) {
 	// Filename format is session-YYYY-MM-DDTHH-MM-<uuid8>.json
 	pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
 	files, _ := filepath.Glob(pattern)
-	if len(files) == 0 {
-		return nil, fmt.Errorf("session file not found for ID: %s", i.GeminiSessionID)
+
+	var sessionFile string
+	if len(files) > 0 {
+		sessionFile = files[0]
+	} else {
+		// Not found at expected path - search ALL project directories
+		sessionFile = findGeminiSessionInAllProjects(i.GeminiSessionID)
+		if sessionFile == "" {
+			return nil, fmt.Errorf("session file not found for ID: %s", i.GeminiSessionID)
+		}
 	}
-	sessionFile := files[0]
 
 	// Read and parse the JSON file
 	data, err := os.ReadFile(sessionFile)
@@ -1693,8 +1743,16 @@ func (i *Instance) Kill() error {
 // For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
 // For dead sessions or unknown ID: recreates the tmux session
 func (i *Instance) Restart() error {
-	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, tmuxSession=%v, tmuxExists=%v",
-		i.Tool, i.ClaudeSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, GeminiSessionID=%q, tmuxSession=%v, tmuxExists=%v",
+		i.Tool, i.ClaudeSessionID, i.GeminiSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+
+	// For Gemini: Update session ID from filesystem BEFORE attempting restart
+	// This ensures we have the latest session ID even if agent-deck was restarted
+	if i.Tool == "gemini" {
+		log.Printf("[RESTART-DEBUG] Gemini: calling UpdateGeminiSession() to detect session ID")
+		i.UpdateGeminiSession(nil)
+		log.Printf("[RESTART-DEBUG] Gemini: after UpdateGeminiSession, GeminiSessionID=%q", i.GeminiSessionID)
+	}
 
 	// Clear flag immediately to prevent it staying set if restart fails
 	skipRegen := i.SkipMCPRegenerate
@@ -2205,6 +2263,35 @@ func (i *Instance) regenerateMCPConfig() error {
 	return nil
 }
 
+// findSessionFileInAllProjects searches for a session file across all Claude project directories.
+// This handles cases where the session was created in a different working directory than
+// what's stored in agent-deck's sessions.json.
+// Returns the full path to the session file if found, empty string otherwise.
+func findSessionFileInAllProjects(configDir, sessionID string) string {
+	projectsDir := filepath.Join(configDir, "projects")
+	sessionFileName := sessionID + ".jsonl"
+
+	// Read all project directories
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		log.Printf("[SESSION-DATA] Error reading projects dir: %v", err)
+		return ""
+	}
+
+	// Search each project directory for the session file
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidatePath := filepath.Join(projectsDir, entry.Name(), sessionFileName)
+		if _, err := os.Stat(candidatePath); err == nil {
+			return candidatePath
+		}
+	}
+
+	return ""
+}
+
 // sessionHasConversationData checks if a Claude session file contains actual
 // conversation data (has "sessionId" field in records).
 //
@@ -2238,12 +2325,17 @@ func sessionHasConversationData(sessionID string, projectPath string) bool {
 	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
 	log.Printf("[SESSION-DATA] Checking session file: %s", sessionFile)
 
-	// Check if file exists
+	// Check if file exists at expected path
 	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
-		// File doesn't exist - use --session-id to create fresh session
-		// (there's nothing to resume if the file doesn't exist)
-		log.Printf("[SESSION-DATA] File does NOT exist → returning false (use --session-id)")
-		return false
+		// File doesn't exist at expected path - search ALL project directories
+		// This handles cases where session was created in a different working directory
+		log.Printf("[SESSION-DATA] File not at expected path, searching all project dirs...")
+		sessionFile = findSessionFileInAllProjects(configDir, sessionID)
+		if sessionFile == "" {
+			log.Printf("[SESSION-DATA] File not found in ANY project dir → returning false (use --session-id)")
+			return false
+		}
+		log.Printf("[SESSION-DATA] Found session file at: %s", sessionFile)
 	}
 
 	log.Printf("[SESSION-DATA] File EXISTS, scanning for sessionId...")
