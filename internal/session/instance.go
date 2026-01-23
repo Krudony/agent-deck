@@ -1087,7 +1087,20 @@ func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	// This handles cases where tmux env is empty/stale but sessions exist on disk
 	sessions, err := ListGeminiSessions(i.ProjectPath)
 	if err != nil || len(sessions) == 0 {
-		// No sessions found on disk, keep current state
+		// No sessions found at expected path - try searching ALL project directories
+		// This handles cases where session was created in different working directory
+		if i.GeminiSessionID != "" {
+			// We have a session ID from sessions.json - try to find it anywhere
+			sessionFile := findGeminiSessionInAllProjects(i.GeminiSessionID)
+			if sessionFile != "" {
+				// Found it! Keep the session ID we already have
+				i.GeminiDetectedAt = time.Now()
+				// Update tmux env to match (if tmux session exists)
+				if i.tmuxSession != nil && i.tmuxSession.Exists() {
+					_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+				}
+			}
+		}
 	} else {
 		// Use the most recent session (already sorted by LastUpdated)
 		for _, sess := range sessions {
