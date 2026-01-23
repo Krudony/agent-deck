@@ -1055,28 +1055,19 @@ func (i *Instance) SetGeminiYoloMode(enabled bool) {
 	}
 }
 
-// UpdateGeminiSession updates the Gemini session ID and YOLO mode from tmux environment
-// AND scans filesystem for the most recent session.
-// This ensures we always use the current session, even if:
+// UpdateGeminiSession updates the Gemini session ID and YOLO mode.
+// Always scans filesystem for the most recent session to handle cases where:
 // - User started a new session but we still have old ID
 // - Session ID changed but tmux env wasn't updated
 // - Agent-deck was restarted and needs to detect existing sessions
+// This ensures we always use the CURRENT session.
 func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	if i.Tool != "gemini" {
 		return
 	}
 
-	// 1. First, try to read from tmux environment (fast path)
+	// 1. Detect YOLO Mode from tmux environment (authoritative sync)
 	if i.tmuxSession != nil {
-		// Detect Session ID from tmux env
-		if sessionID, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && sessionID != "" {
-			if i.GeminiSessionID != sessionID {
-				i.GeminiSessionID = sessionID
-				i.GeminiDetectedAt = time.Now()
-			}
-		}
-
-		// Detect YOLO Mode from environment (authoritative sync)
 		if yoloEnv, err := i.tmuxSession.GetEnvironment("GEMINI_YOLO_MODE"); err == nil && yoloEnv != "" {
 			enabled := yoloEnv == "true"
 			i.GeminiYoloMode = &enabled
@@ -1084,7 +1075,12 @@ func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	}
 
 	// 2. Always scan for the most recent session from files
-	// This handles cases where tmux env is empty/stale but sessions exist on disk
+	// This handles cases where:
+	// - User started a new session but we still have old ID
+	// - Session ID changed but tmux env wasn't updated
+	// This ensures we always use the CURRENT session
+
+	// Scan for most recent session from files
 	sessions, err := ListGeminiSessions(i.ProjectPath)
 	if err != nil || len(sessions) == 0 {
 		// No sessions found at expected path - try searching ALL project directories
@@ -1101,23 +1097,22 @@ func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 				}
 			}
 		}
-	} else {
-		// Use the most recent session (already sorted by LastUpdated)
-		for _, sess := range sessions {
-			if excludeIDs != nil && excludeIDs[sess.SessionID] {
-				continue
-			}
-			// Update to most recent session if different
-			if i.GeminiSessionID != sess.SessionID {
-				i.GeminiSessionID = sess.SessionID
-				i.GeminiDetectedAt = time.Now()
-				// Update tmux env to match (if tmux session exists)
-				if i.tmuxSession != nil && i.tmuxSession.Exists() {
-					_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sess.SessionID)
-				}
-			}
-			break // Use first (most recent) non-excluded session
+		return
+	}
+
+	// Use the most recent session (already sorted by LastUpdated)
+	for _, sess := range sessions {
+		if excludeIDs != nil && excludeIDs[sess.SessionID] {
+			continue
 		}
+		// Always use the most recent session - don't check if it's different
+		i.GeminiSessionID = sess.SessionID
+		i.GeminiDetectedAt = time.Now()
+		// Update tmux env to match (if tmux session exists)
+		if i.tmuxSession != nil && i.tmuxSession.Exists() {
+			_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sess.SessionID)
+		}
+		return
 	}
 
 	// Update analytics if we have a session ID
