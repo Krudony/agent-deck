@@ -1095,8 +1095,18 @@ func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	if i.GeminiSessionID != "" && len(i.GeminiSessionID) >= 8 {
 		sessionsDir := GetGeminiSessionsDir(i.ProjectPath)
 		pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
-		if files, _ := filepath.Glob(pattern); len(files) > 0 {
-			if data, err := os.ReadFile(files[0]); err == nil {
+		files, _ := filepath.Glob(pattern)
+
+		var sessionFile string
+		if len(files) > 0 {
+			sessionFile = files[0]
+		} else {
+			// Not found at expected path - search ALL project directories
+			sessionFile = findGeminiSessionInAllProjects(i.GeminiSessionID)
+		}
+
+		if sessionFile != "" {
+			if data, err := os.ReadFile(sessionFile); err == nil {
 				if prompt, err := parseGeminiLatestUserPrompt(data); err == nil && prompt != "" {
 					i.LatestPrompt = prompt
 				}
@@ -1488,10 +1498,17 @@ func (i *Instance) getGeminiLastResponse() (*ResponseOutput, error) {
 	// Filename format is session-YYYY-MM-DDTHH-MM-<uuid8>.json
 	pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
 	files, _ := filepath.Glob(pattern)
-	if len(files) == 0 {
-		return nil, fmt.Errorf("session file not found for ID: %s", i.GeminiSessionID)
+
+	var sessionFile string
+	if len(files) > 0 {
+		sessionFile = files[0]
+	} else {
+		// Not found at expected path - search ALL project directories
+		sessionFile = findGeminiSessionInAllProjects(i.GeminiSessionID)
+		if sessionFile == "" {
+			return nil, fmt.Errorf("session file not found for ID: %s", i.GeminiSessionID)
+		}
 	}
-	sessionFile := files[0]
 
 	// Read and parse the JSON file
 	data, err := os.ReadFile(sessionFile)
@@ -2205,6 +2222,35 @@ func (i *Instance) regenerateMCPConfig() error {
 	return nil
 }
 
+// findSessionFileInAllProjects searches for a session file across all Claude project directories.
+// This handles cases where the session was created in a different working directory than
+// what's stored in agent-deck's sessions.json.
+// Returns the full path to the session file if found, empty string otherwise.
+func findSessionFileInAllProjects(configDir, sessionID string) string {
+	projectsDir := filepath.Join(configDir, "projects")
+	sessionFileName := sessionID + ".jsonl"
+
+	// Read all project directories
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		log.Printf("[SESSION-DATA] Error reading projects dir: %v", err)
+		return ""
+	}
+
+	// Search each project directory for the session file
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidatePath := filepath.Join(projectsDir, entry.Name(), sessionFileName)
+		if _, err := os.Stat(candidatePath); err == nil {
+			return candidatePath
+		}
+	}
+
+	return ""
+}
+
 // sessionHasConversationData checks if a Claude session file contains actual
 // conversation data (has "sessionId" field in records).
 //
@@ -2238,12 +2284,17 @@ func sessionHasConversationData(sessionID string, projectPath string) bool {
 	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
 	log.Printf("[SESSION-DATA] Checking session file: %s", sessionFile)
 
-	// Check if file exists
+	// Check if file exists at expected path
 	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
-		// File doesn't exist - use --session-id to create fresh session
-		// (there's nothing to resume if the file doesn't exist)
-		log.Printf("[SESSION-DATA] File does NOT exist → returning false (use --session-id)")
-		return false
+		// File doesn't exist at expected path - search ALL project directories
+		// This handles cases where session was created in a different working directory
+		log.Printf("[SESSION-DATA] File not at expected path, searching all project dirs...")
+		sessionFile = findSessionFileInAllProjects(configDir, sessionID)
+		if sessionFile == "" {
+			log.Printf("[SESSION-DATA] File not found in ANY project dir → returning false (use --session-id)")
+			return false
+		}
+		log.Printf("[SESSION-DATA] Found session file at: %s", sessionFile)
 	}
 
 	log.Printf("[SESSION-DATA] File EXISTS, scanning for sessionId...")

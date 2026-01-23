@@ -105,6 +105,40 @@ func parseGeminiSessionFile(filePath string) (GeminiSessionInfo, error) {
 	}, nil
 }
 
+// findGeminiSessionInAllProjects searches for a session file across all Gemini project directories.
+// This handles cases where the session was created in a different working directory than
+// what's stored in agent-deck's sessions.json.
+// Returns the full path to the session file if found, empty string otherwise.
+func findGeminiSessionInAllProjects(sessionID string) string {
+	if sessionID == "" || len(sessionID) < 8 {
+		return ""
+	}
+
+	configDir := GetGeminiConfigDir()
+	tmpDir := filepath.Join(configDir, "tmp")
+
+	// Read all project hash directories
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return ""
+	}
+
+	// Search each project directory for the session file
+	idPrefix := sessionID[:8]
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		chatsDir := filepath.Join(tmpDir, entry.Name(), "chats")
+		pattern := filepath.Join(chatsDir, "session-*-"+idPrefix+".json")
+		if files, _ := filepath.Glob(pattern); len(files) > 0 {
+			return files[0]
+		}
+	}
+
+	return ""
+}
+
 // ListGeminiSessions returns all sessions for a project path
 // Scans ~/.gemini/tmp/<hash>/chats/ and parses session files
 // Sorted by LastUpdated (most recent first)
@@ -143,11 +177,20 @@ func UpdateGeminiAnalyticsFromDisk(projectPath, sessionID string, analytics *Gem
 	// Filename format: session-YYYY-MM-DDTHH-MM-<uuid8>.json
 	pattern := filepath.Join(sessionsDir, "session-*-"+sessionID[:8]+".json")
 	files, _ := filepath.Glob(pattern)
-	if len(files) == 0 {
-		return fmt.Errorf("session file not found")
+
+	var sessionFile string
+	if len(files) > 0 {
+		sessionFile = files[0]
+	} else {
+		// Not found at expected path - search ALL project directories
+		// This handles cases where session was created in different working directory
+		sessionFile = findGeminiSessionInAllProjects(sessionID)
+		if sessionFile == "" {
+			return fmt.Errorf("session file not found")
+		}
 	}
 
-	data, err := os.ReadFile(files[0])
+	data, err := os.ReadFile(sessionFile)
 	if err != nil {
 		return fmt.Errorf("failed to read session file: %w", err)
 	}

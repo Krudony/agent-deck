@@ -548,6 +548,18 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		// Without this, UI renders saved status, then first tick changes it
 		if tmuxSess != nil {
 			_ = inst.UpdateStatus()
+
+			// Sync ClaudeSessionID to tmux environment for resume functionality
+			// This ensures R key works after agent-deck restart
+			// The tmux env var may be lost when agent-deck closes, but sessions.json preserves it
+			if inst.ClaudeSessionID != "" && tmuxSess.Exists() {
+				_ = tmuxSess.SetEnvironment("CLAUDE_SESSION_ID", inst.ClaudeSessionID)
+			}
+
+			// Sync GeminiSessionID to tmux environment for resume functionality
+			if inst.GeminiSessionID != "" && tmuxSess.Exists() {
+				_ = tmuxSess.SetEnvironment("GEMINI_SESSION_ID", inst.GeminiSessionID)
+			}
 		}
 
 		instances[i] = inst
